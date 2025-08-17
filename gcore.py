@@ -1,114 +1,212 @@
 import os
-import time
 import json
-import random
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 from gcore import Gcore
+from dotenv import load_dotenv
+import smtplib
+from email.message import EmailMessage
 
-# === CONFIG ===
-API_KEY = os.getenv("GCORE_API_KEY")  # Recommended: export GCORE_API_KEY=yourkey
 WATCHLIST_FILE = "watchlist.json"
-BLOCKED_THRESHOLD = 50_000
-PASSED_THRESHOLD = 100_000
+DURATION_FILE = "attack_duration.json"  # store start times
+CHECK_INTERVAL_MINUTES = 10
 
-client = Gcore(api_key=API_KEY)
+load_dotenv()
+api_key = os.getenv("GCORE_API_KEY")
+if not api_key:
+    raise RuntimeError("Missing GCORE_API_KEY in environment or .env file")
 
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_TO   = os.getenv("SMTP_TO")
 
-def list_services():
-    """List all available services from Gcore (WAAP)."""
+client = Gcore(api_key=api_key)
+
+watchlist = []
+
+if os.path.exists(WATCHLIST_FILE):
+    with open(WATCHLIST_FILE, "r") as f:
+        saved_ids = json.load(f)
     try:
-        services = client.waap.services.list()
-        print("\n=== Available Services ===")
-        for svc in services:
-            print(f"ID: {svc['id']} | Name: {svc['name']} | Domain: {svc.get('domain', 'N/A')}")
-        return services
+        domains = client.waap.domains.list().results
+        watchlist = [d for d in domains if d.id in saved_ids]
     except Exception as e:
-        print(f"❌ Error fetching services: {e}")
-        return []
+        print(f"Error fetching WAAP domains: {e}")
+        exit(1)
 
+if not watchlist:
+    try:
+        domains = client.waap.domains.list().results
+    except Exception as e:
+        print(f"Error fetching WAAP domains: {e}")
+        exit(1)
 
-def choose_services(services):
-    """Prompt user to choose which services to monitor."""
-    selected = []
-    print("\nEnter the service IDs you want to monitor (comma separated):")
-    ids = input("> ").strip().split(",")
+    print("WAAP domains available:")
+    for i, d in enumerate(domains):
+        print(f"{i+1}) id={d.id} | name={getattr(d,'name','<no-name>')}")
 
-    for i in ids:
-        i = i.strip()
-        for svc in services:
-            if str(svc["id"]) == i:
-                selected.append({"id": svc["id"], "name": svc["name"], "domain": svc.get("domain", "N/A")})
+    selection = input("Enter the numbers of domains to monitor, comma-separated (e.g. 1,3): ")
+    indices = [int(x.strip())-1 for x in selection.split(",") if x.strip().isdigit()]
+    watchlist = [domains[i] for i in indices if 0 <= i < len(domains)]
 
-    if not selected:
-        print("⚠️ No valid services selected, watchlist will be empty.")
-    else:
-        print("\n✅ Selected services:")
-        for s in selected:
-            print(f"- {s['name']} ({s['domain']})")
+    if not watchlist:
+        print("No valid domains selected. Exiting.")
+        exit(1)
 
-    # Save to file
     with open(WATCHLIST_FILE, "w") as f:
-        json.dump(selected, f, indent=2)
-    return selected
+        json.dump([d.id for d in watchlist], f)
+    print(f"Watchlist saved to {WATCHLIST_FILE}")
+
+print("\nMonitoring the following domains:")
+for d in watchlist:
+    print(f"- {getattr(d,'name','<no-name>')} (id={d.id})")
 
 
-def load_watchlist():
-    """Load previously chosen watchlist from file."""
-    if os.path.exists(WATCHLIST_FILE):
-        with open(WATCHLIST_FILE, "r") as f:
-            return json.load(f)
-    return []
+if os.path.exists(DURATION_FILE):
+    with open(DURATION_FILE, "r") as f:
+        attack_start_times = json.load(f)
+        # convert ISO strings to datetime
+        attack_start_times = {k: datetime.fromisoformat(v) for k,v in attack_start_times.items()}
+else:
+    attack_start_times = {}
 
 
-def fetch_stats_for_service(service_id):
-    """Fetch request stats for a specific service ID."""
+def save_attack_start_times():
+    with open(DURATION_FILE, "w") as f:
+        # convert datetime to ISO string
+        json.dump({k:v.isoformat() for k,v in attack_start_times.items()}, f)
+
+
+def send_alert_email(domain_name, blocked, passed, duration_minutes):
+    msg = EmailMessage()
+    msg['Subject'] = f"[WAAP ALERT] DDoS Activity Detected on {domain_name}"
+    msg['From'] = SMTP_USER
+    msg['To'] = SMTP_TO
+
+    html_content = f"""
+    <html>
+    <body>
+        <h2>⚠️ DDoS Alert for {domain_name}</h2>
+        <p><strong>Time:</strong> {datetime.now(timezone.utc).isoformat()}</p>
+        <p><strong>Monitoring Duration:</strong> Last {CHECK_INTERVAL_MINUTES} minutes</p>
+        <p><strong>Attack Ongoing Duration:</strong> {duration_minutes} minutes</p>
+        <table border="1" cellpadding="5" cellspacing="0">
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>Blocked HTTP Requests</td><td>{blocked}</td></tr>
+            <tr><td>Passed HTTP Requests</td><td>{passed}</td></tr>
+        </table>
+        <p>Thresholds:</p>
+        <ul>
+            <li>Blocked &gt; 50,000 → attack ongoing but mitigated</li>
+            <li>Passed &gt; 100,000 → attack ongoing and traffic is passing</li>
+        </ul>
+        <p>Please investigate immediately.</p>
+    </body>
+    </html>
+    """
+    msg.add_alternative(html_content, subtype='html')
+
     try:
-        resp = client.waap.analytics.get_requests(service_id=service_id)
-        # Example: count blocked/passed
-        blocked = sum(1 for r in resp.requests if r.result == "blocked")
-        passed = sum(1 for r in resp.requests if r.result == "passed")
-        return blocked, passed
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        print(f"✅ Alert email sent for {domain_name}")
     except Exception as e:
-        print(f"[{datetime.now()}] ❌ Error fetching stats for {service_id}: {e}")
-        return 0, 0
+        print(f"❌ Failed to send email: {e}")
 
+def send_metrics_alert(domain):
+    domain_id = domain.id
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(minutes=CHECK_INTERVAL_MINUTES)
+    start_str = start_time.isoformat()
+    end_str = end_time.isoformat()
 
-def check_ddos(service, blocked, passed):
-    """Apply thresholds to detect DDoS activity."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if blocked > BLOCKED_THRESHOLD:
-        print(f"[{ts}] 🚨 {service['name']} ({service['domain']}): Mitigated DDoS detected (blocked={blocked})")
-    elif passed > PASSED_THRESHOLD:
-        print(f"[{ts}] ⚠️ {service['name']} ({service['domain']}): Ongoing DDoS (passed={passed})")
-    else:
-        print(f"[{ts}] ✅ {service['name']} ({service['domain']}): Normal (blocked={blocked}, passed={passed})")
+    try:
+        metrics = client.waap.domains.statistics.get_traffic_series(
+            domain_id=domain_id,
+            start=start_str,
+            end=end_str,
+            resolution="minutely"
+        )
 
+        blocked_total = sum((getattr(m,"policyBlocked",0) or 0) +
+                            (getattr(m,"customBlocked",0) or 0) +
+                            (getattr(m,"ddosBlocked",0) or 0) for m in metrics)
+        passed_total = sum((getattr(m,"passedToOrigin",0) or 0) for m in metrics)
 
-def main():
-    # Step 1: Load existing watchlist or let user pick
-    watchlist = load_watchlist()
+        print(f"[{getattr(domain,'name','<no-name>')}] Blocked={blocked_total}, Passed={passed_total}")
+
+        # Check thresholds
+        alert = blocked_total > 50000 or passed_total > 100000
+
+        if alert:
+            # track duration
+            if domain.id not in attack_start_times:
+                attack_start_times[domain.id] = datetime.now(timezone.utc)
+            duration_minutes = int((datetime.now(timezone.utc) - attack_start_times[domain.id]).total_seconds() / 60)
+
+            send_alert_email(
+                domain_name=getattr(domain,'name','<no-name>'),
+                blocked=blocked_total,
+                passed=passed_total,
+                duration_minutes=duration_minutes
+            )
+        else:
+            # reset duration if under threshold
+            if domain.id in attack_start_times:
+                del attack_start_times[domain.id]
+
+        save_attack_start_times()
+
+    except Exception as e:
+        print(f"Error fetching stats for domain {getattr(domain,'name','<no-name>')}: {e}")
+
+def send_test_email():
     if not watchlist:
-        print("No watchlist found. Fetching services...")
-        services = list_services()
-        if services:
-            watchlist = choose_services(services)
-
-    # Step 2: Start monitoring loop
-    if not watchlist:
-        print("❌ No services to monitor. Exiting.")
+        print("Watchlist is empty. Cannot send test email.")
         return
 
-    print("\n=== Starting Monitoring Loop ===")
-    while True:
-        for svc in watchlist:
-            blocked, passed = fetch_stats_for_service(svc["id"])
-            check_ddos(svc, blocked, passed)
+    domain = watchlist[0]
+    domain_id = domain.id
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(minutes=CHECK_INTERVAL_MINUTES)
+    start_str = start_time.isoformat()
+    end_str = end_time.isoformat()
 
-        # Sleep 10–15 min
-        delay = 600 + random.randint(0, 300)
-        print(f"\nNext check in {delay//60} minutes...\n")
-        time.sleep(delay)
+    try:
+        metrics = client.waap.domains.statistics.get_traffic_series(
+            domain_id=domain_id,
+            start=start_str,
+            end=end_str,
+            resolution="minutely"
+        )
 
+        blocked_total = sum((getattr(m,"policyBlocked",0) or 0) +
+                            (getattr(m,"customBlocked",0) or 0) +
+                            (getattr(m,"ddosBlocked",0) or 0) for m in metrics)
+        passed_total = sum((getattr(m,"passedToOrigin",0) or 0) for m in metrics)
 
-if __name__ == "__main__":
-    main()
+        duration_minutes = CHECK_INTERVAL_MINUTES  # for test, just use interval
+
+        send_alert_email(
+            domain_name=getattr(domain,'name','<no-name>'),
+            blocked=blocked_total,
+            passed=passed_total,
+            duration_minutes=duration_minutes
+        )
+        print(f"✅ Test email sent successfully for domain {getattr(domain,'name','<no-name>')}")
+
+    except Exception as e:
+        print(f"❌ Failed to send test email: {e}")
+
+# Uncomment to send test email
+#send_test_email()
+while True:
+    print(f"\nChecking WAAP stats at {datetime.now(timezone.utc).isoformat()}")
+    for domain in watchlist:
+        send_metrics_alert(domain)
+    print(f"Waiting {CHECK_INTERVAL_MINUTES} minutes before next check...")
+    time.sleep(CHECK_INTERVAL_MINUTES * 60)

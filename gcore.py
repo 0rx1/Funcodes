@@ -20,6 +20,7 @@ SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM")   
 SMTP_TO   = os.getenv("SMTP_TO")
 
 client = Gcore(api_key=api_key)
@@ -80,42 +81,33 @@ def save_attack_start_times():
 
 
 def send_alert_email(domain_name, blocked, passed, duration_minutes):
-    msg = EmailMessage()
-    msg['Subject'] = f"[WAAP ALERT] DDoS Activity Detected on {domain_name}"
-    msg['From'] = SMTP_USER
-    msg['To'] = SMTP_TO
-
-    html_content = f"""
+    subject = f"🚨 DDoS Alert for {domain_name}"
+    body = f"""
     <html>
     <body>
         <h2>⚠️ DDoS Alert for {domain_name}</h2>
-        <p><strong>Time:</strong> {datetime.now(timezone.utc).isoformat()}</p>
-        <p><strong>Monitoring Duration:</strong> Last {CHECK_INTERVAL_MINUTES} minutes</p>
-        <p><strong>Attack Ongoing Duration:</strong> {duration_minutes} minutes</p>
-        <table border="1" cellpadding="5" cellspacing="0">
-            <tr><th>Metric</th><th>Value</th></tr>
-            <tr><td>Blocked HTTP Requests</td><td>{blocked}</td></tr>
-            <tr><td>Passed HTTP Requests</td><td>{passed}</td></tr>
-        </table>
-        <p>Thresholds:</p>
-        <ul>
-            <li>Blocked &gt; 50,000 → attack ongoing but mitigated</li>
-            <li>Passed &gt; 100,000 → attack ongoing and traffic is passing</li>
-        </ul>
-        <p>Please investigate immediately.</p>
+        <p><b>Blocked Requests:</b> {blocked:,}</p>
+        <p><b>Passed Requests:</b> {passed:,}</p>
+        <p><b>Duration:</b> {duration_minutes} minutes</p>
+        <p>Thresholds: Blocked > 50,000 or Passed > 100,000</p>
     </body>
     </html>
     """
-    msg.add_alternative(html_content, subtype='html')
+
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_FROM   # 👈 explicit sender email
+    msg["To"] = SMTP_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "html"))
 
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-        print(f"✅ Alert email sent for {domain_name}")
+            server.sendmail(SMTP_FROM, SMTP_TO, msg.as_string())  # 👈 use SMTP_FROM here
+        print(f"[INFO] Alert email sent for {domain_name}")
     except Exception as e:
-        print(f"❌ Failed to send email: {e}")
+        print(f"[ERROR] Failed to send email: {e}")
 
 def send_metrics_alert(domain):
     domain_id = domain.id

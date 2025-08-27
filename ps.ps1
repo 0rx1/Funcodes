@@ -88,3 +88,8 @@ function Get-ConnectionsFallback {
 $all = Get-ConnectionsFallback
 $all | Sort-Object Protocol, LocalAddress, LocalPort | Format-Table -AutoSize
 # $all | Export-Csv .\connections.csv -NoTypeInformation
+
+
+
+# One liner 
+netstat -ano | ForEach-Object { if ($_ -match '^\s*(TCP|UDP)') { $p=($_ -split '\s+') -ne ''; $procId=$p[-1]; $le=$p[1] -split ':'; $re=$p[2] -split ':'; $state= if($p[0] -eq 'TCP'){$p[-2]} else {''}; [PSCustomObject]@{Protocol=$p[0];LocalAddress=$le[0];LocalPort=$le[1];RemoteAddress=$re[0];RemotePort=$re[1];State=$state;ProcId=$procId;Process=(Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName} } } | Format-Table -AutoSize
